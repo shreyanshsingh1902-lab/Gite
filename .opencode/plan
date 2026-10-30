@@ -1,0 +1,201 @@
+# gite plan
+
+Self-hosted git forge where repo storage is a choice. Native git is the engine,
+gite is the gatekeeper and the manager. A repo can live on the gite server, on
+another provider, or on your own machine behind NAT, reached through an agent
+that dials out. The web UI manages; git stays the truth.
+
+Pitch line: "the git forge that doesn't own your code."
+
+The novel part is placement. Gitea, Forgejo, GitLab, SourceHut all assume repos
+live on their servers. That assumption is the thing we're removing.
+
+## Ground rules
+
+- Native `git` binary does all git work. No packfile parsing, ever.
+- Never report a push as accepted until it hit that repo's source of truth.
+- Transport before pixels: SSH + smart HTTP working beats a pretty UI.
+- Single binary, SQLite for v1, templates and assets embedded via `go:embed`.
+
+## Repo structure
+
+```
+gite/
+├── cmd/
+│   ├── gite/
+│   │   └── main.go        # subcommands: serve, serve-git (SSH forced command),
+│   │                      # keys (AuthorizedKeysCommand), migrate, admin
+│   └── gite-agent/
+│       └── main.go        # phase 2: outbound agent for machine-hosted repos
+├── internal/
+│   ├── config/            # flags + file + env; paths: repo root, db, ssh host
+│   ├── db/                # open sqlite, embedded migrations, models
+│   ├── auth/
+│   │   ├── users.go       # accounts, password hash
+│   │   ├── keys.go        # ssh key add/list, fingerprint lookup
+│   │   ├── tokens.go      # personal access tokens, stored hashed
+│   │   ├── session.go     # cookie sessions for the web viewer
+│   │   └── perms.go       # RequireAccess(user, repo, read|write|admin)
+│   ├── repository/
+│   │   ├── registry.go    # create/rename/delete repo rows, slug rules
+│   │   ├── backends.go    # dispatch: server | agent | external | mirror
+│   │   └── disk.go        # bare repo layout under repo root
+│   ├── git/
+│   │   ├── git.go         # exec wrappers: init, refs, log, ls-tree, cat-file, diff
+│   │   └── errors.go      # turn git stderr into honest user-facing errors
+│   ├── gateway/
+│   │   ├── sshserve.go    # forced command: parse SSH_ORIGINAL_COMMAND, perm-check, exec git
+│   │   └── httpgit.go     # smart HTTP: /{owner}/{repo}.git/info/refs, upload/receive-pack
+│   ├── webui/
+│   │   ├── server.go      # mux + middleware: session, repo ctx, requireRole
+│   │   ├── handlers/      # repo browse, commits, branches, settings, account
+│   │   ├── views/         # templates
+│   │   └── static/        # css, minimal js
+│   ├── agent/             # phase 2: outbound tunnel, repo registration, push routing
+│   └── providers/         # phase 3: github/gitlab API adapters, mirroring
+├── docs/
+│   └── auth.md            # one page on how access decisions are made
+└── go.mod                 # rename module first (currently gitlab.com/... competitor name)
+```
+
+## Auth layer (github-style access)
+
+Users only in v1; orgs and teams come later.
+
+Roles per repo: `read`, `write`, `admin`. Repo owner is implicitly `admin`
+(not stored). Anonymous users are `none` unless the repo is public.
+
+- **public repo**: anyone may clone/fetch/browse. Only `write`/`admin` may push.
+- **private repo**: only listed collaborators may clone/fetch/browse.
+  `read` for fetch, `write` for push, `admin` for delete/rename/settings.
+- A private repo you have no role on returns 404, not 403. You learn nothing.
+
+One choke point: `auth.RequireAccess(user, repo, want)`. Every door calls it.
+
+Three doors, same check:
+
+1. **SSH transport (phase 0).** User adds an ssh pubkey to their account.
+   `sshd` matches the key via `AuthorizedKeysCommand` (`gite keys %f`),
+   which prints a forced command line carrying the username. The forced
+   command (`gite serve-git`) reads `SSH_ORIGINAL_COMMAND`, parses
+   `git-upload-pack` / `git-receive-pack` plus the repo path, resolves
+   owner/repo, and calls `RequireAccess`: upload-pack needs `read`,
+   receive-pack needs `write`. Pass → exec git into the bare repo. Fail →
+   short stderr explanation, no details leaked.
+
+2. **HTTP git transport (phase 1).** Basic auth, username = account,
+   password = personal access token. Token hashes live in the db. Same
+   `RequireAccess` call on `info/refs` before anything streams.
+
+3. **Web viewer (phase 1).** Cookie session or token. Every handler runs
+   behind `requireRole` middleware computed from the repo context.
+   Settings page is `admin`-only.
+
+Tokens, keys, and sessions are three separate secrets for three separate doors.
+Never reuse a web session to push.
+
+## DB schema (v1)
+
+```sql
+users(id, username UNIQUE, email UNIQUE, password_hash, is_admin, created_at)
+sessions(id, user_id, cookie_hash, expires_at)
+ssh_keys(id, user_id, title, fingerprint UNIQUE, pubkey, added_at)
+pat_tokens(id, user_id, name, token_hash UNIQUE, scopes, created_at, expires_at, last_used_at)
+repos(id, owner_id, name, description, private, backend, backend_path,
+      default_branch, created_at, UNIQUE(owner_id, name))
+repo_collabs(repo_id, user_id, role CHECK(role IN ('read','write','admin')),
+             PRIMARY KEY(repo_id, user_id))
+-- phase 2
+agents(id, user_id, name, status, last_seen_at)
+agent_repos(agent_id, repo_id, path)
+-- phase 3
+repo_remotes(repo_id, url, kind, is_primary)
+```
+
+## Web viewer (phase 1)
+
+Pages, all role-gated:
+
+- `/` dashboard: your repos, public/explore list, create-repo button
+- `/login`, `/register` (is_admin flag gates registration later)
+- `/settings/keys`, `/settings/tokens`, `/settings/profile`
+- `/{owner}` user page with their visible repos
+- `/{owner}/{repo}` home: readme, file list, latest commit, clone URL box
+- `/{owner}/{repo}/tree/{ref}/**` directory browse
+- `/{owner}/{repo}/blob/{ref}/**` file view plus `/raw/...`
+- `/{owner}/{repo}/commits/{ref}` and `/commit/{sha}` with diff
+- `/{owner}/{repo}/branches`, `/tags`
+- `/{owner}/{repo}/settings` admin-only
+
+Server-rendered templates, no SPA. Sourcehut is a good bar here: fast, plain,
+no framework circus.
+
+## Phases
+
+### Phase 0, forge floor (3-4 focused days)
+
+1. Rename module path in go.mod.
+2. Config, db open, migrations, schema above.
+3. User accounts + ssh key management (CLI first: `gite admin`, `gite keys`).
+4. Repo registry: create/delete bare repos via `git init --bare`.
+5. sshd integration + `gite keys` AuthorizedKeysCommand + `gite serve-git`
+   forced command with RequireAccess.
+6. Bonus: http git transport if the ssh flow lands early.
+
+Done when: fresh user, added key, `git clone ssh://gite@host/owner/repo.git`,
+commit, push, branch, tag all work with a normal client, and a
+non-collaborator gets rejected at both doors.
+
+### Phase 1, web viewer + smart HTTP (1-2 weeks)
+
+1. Token issue flow + basic-auth smart HTTP.
+2. Session login, flags, dashboards.
+3. Repo pages: file browser, blob view with basic syntax highlighting,
+   readme rendering, commits, diffs, branches/tags.
+4. Collaborator management UI (add/remove/change roles).
+
+Done when: you can manage everything the forge does from the browser, and
+push over https with a token.
+
+### Phase 2, the agent, the reason this project is novel (2-3 weeks)
+
+1. `gite-agent`, machine-side, outbound-only connection (NAT unaffected).
+2. Agent registers itself and its repos into the registry, backend = agent.
+3. Pushes to an agent repo are tunneled to the machine, the agent execs a
+   real `git receive-pack` against the canonical bare repo there.
+4. gite reports success only after that receive finished. Machine offline
+   or laptop asleep → push rejected with a clear, honest message.
+   Optional later: visible queued state, still never a fake accept.
+5. Web viewer reads through the agent the same way.
+
+Done when a repo whose canonical copy is on your laptop clones/pushes through
+gite by a second user, and a closed lid breaks pushes loudly rather than silently.
+
+### Phase 3, placement beyond your machine (2-4 weeks)
+
+1. External backend: register a github/gitlab/other URL, browse it, freshen it.
+2. Mirror: one designated primary, replicas follow. No split-brain writes;
+   two machines accepting independent writes is how histories diverge.
+3. Provider adapters where an API exists.
+
+### Explicitly not in v1
+
+- Issues, PRs, review, CI. You can't review code you can't push.
+- Orgs, teams. One tier of users until the model hurts.
+- Federation. Multi-year identity/trust/conflict problem; revisit when there
+  are two real nodes. Every forge roadmap that promised this shipped a demo.
+- Reimplemented git internals. Twenty years of hardened packfile code exists;
+  call it.
+
+## Kill criteria / check
+
+If phase 0 doesn't produce a working push within ~1 week of build time,
+re-scope before adding anything. The forge floor is the foundation;
+everything else sits on it or doesn't exist.
+
+## Local state
+
+- Repo = `/Users/darshanjaidka/code/gite`
+- Current: one untracked `go.mod` (`module gitlab.com/jayeshpuri_21/gite.git`,
+  go 1.27.3), no commits, nothing else
+- First code: module rename + `cmd/gite/main.go` skeleton + config + db
