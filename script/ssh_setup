@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+
+mkdir -p ../.temp
+ssh-keygen -t ed25519 -C "majinBuu" -N "" -f ../.temp/sshKey
