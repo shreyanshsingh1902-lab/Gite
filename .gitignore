@@ -1,2 +1,22 @@
+# Build output
+bin/
+
+# Runtime data
+data/
+custom/
 .temp/
-main
+
+# SQLite databases
+*.db
+*.db-wal
+*.db-shm
+
+# SSH host key (generated at runtime, never commit)
+ssh_host_ed25519_key
+ssh_host_ed25519_key.pub
+
+# macOS
+.DS_Store
+
+# Editor
+.opencode/
